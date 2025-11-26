@@ -1,54 +1,73 @@
-name: CI-CD (infra -> app)
+﻿name: CI-CD
 
 on:
   push:
-    branches: [ main, 'feature/*' ]
-  pull_request:
-    branches: [ main ]
+    branches: [ main, feature/m5-capstone ]
+  workflow_dispatch:
 
 jobs:
-  infra:
-    name: Infra (what-if & deploy)
+  build-and-push:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Setup Azure CLI
-        uses: azure/cli@v1
-      - name: Bicep what-if
-        run: az deployment group what-if --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} --template-file infra/main.bicep --parameters @infra/parameters.dev.json || true
-      - name: Deploy infra (manual secrets required)
-        if: github.ref == 'refs/heads/main'
+      
+      - name: Log in to ACR
         run: |
-          az deployment group create --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} --template-file infra/main.bicep --parameters @infra/parameters.dev.json
-
-  app:
-    name: Build & Deploy App (canary)
-    needs: infra
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
-      - name: Login to ACR
-        uses: azure/docker-login@v1
-        with:
-          login-server: ${{ secrets.ACR_LOGIN_SERVER }}
-          username: ${{ secrets.ACR_USERNAME }}
-          password: ${{ secrets.ACR_PASSWORD }}
+          az login --service-principal -u ${{ fromJson(secrets.AZURE_CREDENTIALS).clientId }} -p ${{ fromJson(secrets.AZURE_CREDENTIALS).clientSecret }} --tenant ${{ fromJson(secrets.AZURE_CREDENTIALS).tenantId }}
+          az acr login --name ${{ secrets.ACR_NAME }}
+      
       - name: Build and push image
         run: |
-          IMAGE=${{ secrets.ACR_LOGIN_SERVER }}/capstone-backend:${{ github.sha }}
-          docker build -t $IMAGE ./backend
+          IMAGE=${{ secrets.ACR_LOGIN_SERVER }}/capstone-app:${{ github.sha }}
+          docker build -t $IMAGE -f capstone/backend/Dockerfile .
           docker push $IMAGE
-          echo "IMAGE=$IMAGE" >> $GITHUB_OUTPUT
-      - name: Deploy Container App revision (canary 10%)
-        env:
-          IMAGE: ${{ steps.build_and_push.outputs.IMAGE }}
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      
+      - name: Deploy containerapp (update image + env)
         run: |
-          echo "Placeholder deploy step: use az cli or GitOps to update Container App to image $IMAGE and route 10% traffic to new revision"
-      - name: Smoke test
+          IMAGE=${{ secrets.ACR_LOGIN_SERVER }}/capstone-app:${{ github.sha }}
+          az containerapp update \
+            --name ${{ secrets.CONTAINERAPP_NAME }} \
+            --resource-group ${{ secrets.RESOURCE_GROUP }} \
+            --image $IMAGE \
+            --set-env-vars APPINSIGHTS_CONNECTION_STRING='${{ secrets.APPINSIGHTS_CONNECTION_STRING }}'
+      
+      - name: Set canary traffic (10%)
         run: |
-          sleep 5
-          curl -fS "https://your-app-url/health" || (echo 'smoke test failed' && exit 1)
-      - name: Promote or rollback (manual decision)
-        run: echo "Promotion/rollback step: automated logic should evaluate telemetry and decide"
+          az containerapp ingress traffic set \
+            --name ${{ secrets.CONTAINERAPP_NAME }} \
+            --resource-group ${{ secrets.RESOURCE_GROUP }} \
+            --traffic latest=10
+      
+      - name: Wait and run smoke tests
+        run: |
+          sleep 15
+          CONTAINERAPP_URL=$(az containerapp show -n ${{ secrets.CONTAINERAPP_NAME }} -g ${{ secrets.RESOURCE_GROUP }} --query properties.configuration.ingress.fqdn -o tsv)
+          curl -f https://${CONTAINERAPP_URL}/health || exit 1
+      
+      - name: Promote canary to 100%
+        if: success()
+        run: |
+          az containerapp ingress traffic set \
+            --name ${{ secrets.CONTAINERAPP_NAME }} \
+            --resource-group ${{ secrets.RESOURCE_GROUP }} \
+            --traffic latest=100
+      
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          az containerapp ingress traffic set \
+            --name ${{ secrets.CONTAINERAPP_NAME }} \
+            --resource-group ${{ secrets.RESOURCE_GROUP }} \
+            --traffic latest=0
+          echo "Canary deployment failed; rolled back to previous revision."
+          exit 1

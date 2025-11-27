@@ -1,33 +1,19 @@
-from fastapi import FastAPI, Request
+﻿from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from .routes import router as api_router
 from .logging_config import configure_logging
-from .telemetry import init_telemetry
 import os
-from opentelemetry import trace
 
 configure_logging()
 
 app = FastAPI()
 app.include_router(api_router)
 
-# initialize telemetry (no-op if not configured)
-try:
-    init_telemetry(app)
-except Exception:
-    pass
-
 
 @app.middleware('http')
 async def add_request_id(request: Request, call_next):
     request_id = request.headers.get('X-Request-ID') or request.headers.get('x-request-id') or os.urandom(8).hex()
     request.state.request_id = request_id
-    # annotate current span with request_id for correlation
-    try:
-        span = trace.get_current_span()
-        span.set_attribute('request_id', request_id)
-    except Exception:
-        pass
     response = await call_next(request)
     response.headers['X-Request-ID'] = request_id
     return response
